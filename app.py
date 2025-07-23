@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 from snowflake.snowpark import Session
 
+import os
+
 # --- AIG Branding: High Contrast Custom CSS ---
 AIG_BLUE = "#003366"   # Much darker blue for contrast
 AIG_DARK = "#000000"   # Black for maximum contrast
@@ -70,6 +72,38 @@ st.markdown(
     """,
     unsafe_allow_html=True
 )
+
+# --- Set cookies with SameSite=None; Secure for session and xsrf ---
+def set_cookie_headers():
+    # This function attempts to set the relevant cookies with SameSite=None; Secure
+    # Streamlit does not provide a direct API, so we use a workaround with st.markdown and JS
+    # This will set cookies in the browser for session and xsrf if they exist
+    js = """
+    <script>
+    function setCookieWithAttrs(name) {
+        var value = null;
+        // Try to get the cookie value
+        var cookies = document.cookie.split(';');
+        for (var i=0; i<cookies.length; i++) {
+            var c = cookies[i].trim();
+            if (c.indexOf(name + "=") == 0) {
+                value = c.substring((name + "=").length, c.length);
+                break;
+            }
+        }
+        if (value !== null) {
+            // Set again with SameSite=None; Secure
+            document.cookie = name + "=" + value + "; path=/; SameSite=None; Secure";
+        }
+    }
+    setCookieWithAttrs("session");
+    setCookieWithAttrs("xsrf-token");
+    setCookieWithAttrs("XSRF-TOKEN");
+    </script>
+    """
+    st.markdown(js, unsafe_allow_html=True)
+
+set_cookie_headers()
 
 st.markdown('<div class="aig-header">Guest Log CSV Uploader</div>', unsafe_allow_html=True)
 
