@@ -172,37 +172,100 @@ def validate_and_cast_row(row, col_map, col_types):
             return None, f"Type error in column '{orig_col}'"
     return casted, None
 
-def insert_rows_skip_duplicates(valid_rows, session, fq_table, pk_cols, col_types):
+def insert_rows_update_duplicates(valid_rows, session, fq_table, pk_cols, col_types):
     """
-    Insert new rows only. If a row is a duplicate (PK exists), skip it (do not update).
-    Returns: inserted_count, skipped_count, new_rows_df, skipped_rows_df
+    Insert new rows. If a row is a duplicate (PK exists), check if the row is identical to the existing record.
+    - If identical, skip.
+    - If different, update the record.
+    Returns: inserted_count, updated_count, skipped_count, new_rows_df, updated_rows_df, skipped_rows_df
     """
     if not valid_rows:
-        return 0, 0, pd.DataFrame(), pd.DataFrame()
+        return 0, 0, 0, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     df = pd.DataFrame(valid_rows)
     # Remove duplicates on PK within the upload itself
     df = df.drop_duplicates(subset=pk_cols)
-    # Get existing PKs from Snowflake
-    existing = session.table(fq_table).select(*pk_cols).to_pandas()
-    for pk in pk_cols:
-        if col_types[pk] == str:
-            existing[pk] = existing[pk].astype(str)
-        elif col_types[pk] == "date":
-            existing[pk] = pd.to_datetime(existing[pk], errors="coerce").dt.date
-        elif col_types[pk] == "datetime":
-            existing[pk] = pd.to_datetime(existing[pk], errors="coerce")
-        elif col_types[pk] == int:
-            existing[pk] = pd.to_numeric(existing[pk], errors="coerce").astype("Int64")
-        elif col_types[pk] == float:
-            existing[pk] = pd.to_numeric(existing[pk], errors="coerce")
-        elif col_types[pk] == "bool":
-            existing[pk] = existing[pk].astype(bool)
-    # Merge to classify new vs existing
-    merged = df.merge(existing, on=pk_cols, how='left', indicator=True)
+    # Get all columns for PKs in upload from Snowflake
+    existing = session.table(fq_table).filter(
+        " OR ".join([
+            " AND ".join([f"{pk} = '{row[pk]}'" if col_types[pk] != int and col_types[pk] != float else f"{pk} = {row[pk]}" for pk in pk_cols])
+            for _, row in df.iterrows()
+        ])
+    ).to_pandas() if not df.empty else pd.DataFrame()
+    # If no existing, just insert all
+    if existing.empty:
+        inserted = 0
+        for _, r in df.iterrows():
+            values = []
+            for col in df.columns:
+                val = r[col]
+                if pd.isnull(val):
+                    values.append("NULL")
+                elif col_types[col] == "date":
+                    values.append(f"'{val}'")
+                elif col_types[col] == "datetime":
+                    values.append(f"'{val.strftime('%Y-%m-%d %H:%M:%S')}'")
+                elif col_types[col] == "bool":
+                    values.append("TRUE" if val else "FALSE")
+                elif col_types[col] == int or col_types[col] == float:
+                    values.append(str(val))
+                else:
+                    values.append("'" + str(val).replace("'", "''") + "'")
+            sql = f"INSERT INTO {fq_table} ({', '.join(df.columns)}) VALUES ({', '.join(values)})"
+            session.sql(sql).collect()
+            inserted += 1
+        return inserted, 0, 0, df, pd.DataFrame(), pd.DataFrame()
+    # Normalize types for comparison
+    for col in df.columns:
+        if col in col_types:
+            if col_types[col] == str:
+                existing[col] = existing[col].astype(str)
+                df[col] = df[col].astype(str)
+            elif col_types[col] == "date":
+                existing[col] = pd.to_datetime(existing[col], errors="coerce").dt.date
+                df[col] = pd.to_datetime(df[col], errors="coerce").dt.date
+            elif col_types[col] == "datetime":
+                existing[col] = pd.to_datetime(existing[col], errors="coerce")
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+            elif col_types[col] == int:
+                existing[col] = pd.to_numeric(existing[col], errors="coerce").astype("Int64")
+                df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
+            elif col_types[col] == float:
+                existing[col] = pd.to_numeric(existing[col], errors="coerce")
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            elif col_types[col] == "bool":
+                existing[col] = existing[col].astype(bool)
+                df[col] = df[col].astype(bool)
+    # Merge to classify new, update, skip
+    merged = df.merge(existing, on=pk_cols, how='left', suffixes=('', '_existing'), indicator=True)
     new_rows = merged[merged['_merge'] == 'left_only'].drop(columns=['_merge'])
-    skipped_rows = merged[merged['_merge'] == 'both'].drop(columns=['_merge'])
+    # For rows with PK match, compare all columns
+    updated_rows = []
+    skipped_rows = []
+    for idx, row in merged[merged['_merge'] == 'both'].iterrows():
+        is_identical = True
+        for col in df.columns:
+            if col in pk_cols:
+                continue
+            val_new = row[col]
+            val_exist = row.get(f"{col}_existing", None)
+            # For NaN/None, treat as equal if both are null
+            if pd.isnull(val_new) and pd.isnull(val_exist):
+                continue
+            if isinstance(val_new, float) and isinstance(val_exist, float):
+                if pd.isnull(val_new) and pd.isnull(val_exist):
+                    continue
+                if abs(val_new - val_exist) > 1e-9:
+                    is_identical = False
+                    break
+            elif str(val_new) != str(val_exist):
+                is_identical = False
+                break
+        if is_identical:
+            skipped_rows.append(row[df.columns])
+        else:
+            updated_rows.append(row[df.columns])
+    # Insert new rows
     inserted = 0
-    # Insert new rows only
     for _, r in new_rows.iterrows():
         values = []
         for col in df.columns:
@@ -222,8 +285,35 @@ def insert_rows_skip_duplicates(valid_rows, session, fq_table, pk_cols, col_type
         sql = f"INSERT INTO {fq_table} ({', '.join(df.columns)}) VALUES ({', '.join(values)})"
         session.sql(sql).collect()
         inserted += 1
+    # Update changed rows
+    updated = 0
+    for _, r in pd.DataFrame(updated_rows).iterrows():
+        set_clause = []
+        for col in df.columns:
+            if col in pk_cols:
+                continue
+            val = r[col]
+            if pd.isnull(val):
+                set_clause.append(f"{col}=NULL")
+            elif col_types[col] == "date":
+                set_clause.append(f"{col}='{val}'")
+            elif col_types[col] == "datetime":
+                set_clause.append(f"{col}='{val.strftime('%Y-%m-%d %H:%M:%S')}'")
+            elif col_types[col] == "bool":
+                set_clause.append(f"{col}={'TRUE' if val else 'FALSE'}")
+            elif col_types[col] == int or col_types[col] == float:
+                set_clause.append(f"{col}={val}")
+            else:
+                set_clause.append(f"{col}='" + str(val).replace("'", "''") + "'")
+        where_clause = " AND ".join([
+            f"{pk}='{r[pk]}'" if col_types[pk] != int and col_types[pk] != float else f"{pk}={r[pk]}"
+            for pk in pk_cols
+        ])
+        sql = f"UPDATE {fq_table} SET {', '.join(set_clause)} WHERE {where_clause}"
+        session.sql(sql).collect()
+        updated += 1
     skipped = len(skipped_rows)
-    return inserted, skipped, new_rows, skipped_rows
+    return inserted, updated, skipped, new_rows, pd.DataFrame(updated_rows), pd.DataFrame(skipped_rows)
 
 def colored_box(markdown, color="#f8d7da", text_color="#212529", border_color=None, icon=None):
     # Modern, high-contrast error/warning/info banners
@@ -266,9 +356,9 @@ if uploaded_file:
     rejected_rows = []
     rejected_reasons = []
     valid_rows = []
-    inserted = skipped = 0
-    new_rows = skipped_rows = pd.DataFrame()
-    show_inserted = show_skipped = False
+    inserted = updated = skipped = 0
+    new_rows = updated_rows = skipped_rows = pd.DataFrame()
+    show_inserted = show_updated = show_skipped = False
 
     filename = uploaded_file.name
     table_key = match_table(filename)
@@ -315,9 +405,12 @@ if uploaded_file:
                 warning_banner = f"⚠️ {len(rejected_rows)} row(s) were rejected due to missing or invalid values. Only valid rows will be uploaded."
 
         if not error_banner and len(valid_rows) > 0:
-            # --- Insert logic (skip duplicates) ---
-            inserted, skipped, new_rows, skipped_rows = insert_rows_skip_duplicates(valid_rows, session, fq_table, pk_cols, col_types)
+            # --- Insert/update/skip logic ---
+            inserted, updated, skipped, new_rows, updated_rows, skipped_rows = insert_rows_update_duplicates(
+                valid_rows, session, fq_table, pk_cols, col_types
+            )
             show_inserted = inserted > 0
+            show_updated = updated > 0
             show_skipped = skipped > 0
 
     # --- Banners (immediately below file name) ---
@@ -379,7 +472,7 @@ if uploaded_file:
     # --- Section: Skipped rows (yellow background, after rejected) ---
     if show_skipped and skipped > 0:
         st.markdown(
-            "<div style='margin-top:1em; margin-bottom:0.5em; font-size:1.2em;'><b>⏭️ Skipped: {}</b></div>".format(skipped),
+            "<div style='margin-top:1em; margin-bottom:0.5em; font-size:1.2em;'><b>⏭️ Skipped (identical to existing): {}</b></div>".format(skipped),
             unsafe_allow_html=True
         )
         st.markdown(
@@ -391,7 +484,22 @@ if uploaded_file:
         st.dataframe(skipped_rows.reset_index(drop=True))
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # --- Section: Inserted rows (green header, after skipped) ---
+    # --- Section: Updated rows (blue background, after skipped) ---
+    if show_updated and updated > 0:
+        st.markdown(
+            "<div style='margin-top:1em; margin-bottom:0.5em; font-size:1.2em;'><b>🔄 Updated: {}</b></div>".format(updated),
+            unsafe_allow_html=True
+        )
+        st.markdown(
+            """
+            <div style="background-color: #2196f3; color: #fff; padding: 0.5em 0.5em 0.5em 0.5em; border-radius: 8px;">
+            """,
+            unsafe_allow_html=True
+        )
+        st.dataframe(updated_rows.reset_index(drop=True))
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # --- Section: Inserted rows (green header, after updated) ---
     if show_inserted and inserted > 0:
         st.markdown(
             "<div style='margin-top:1em; margin-bottom:0.5em; font-size:1.2em;'><b>🆕 Inserted: {}</b></div>".format(inserted),
